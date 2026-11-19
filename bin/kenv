@@ -125,8 +125,28 @@ _kenv_proj_keys() {
 	(( $#_kenv_reply )) || { _kenv_err "no keys stored for $1/ (kenv set $1/<NAME>)"; return 1 }
 }
 
+# Print "unlocked" or "locked" without any dialog, or fail.
+# `security show-keychain-info` asks for the password when the keychain is locked, so the
+# state comes from the Security framework (SecKeychainGetStatus) through JXA instead.
+_kenv_lock_state() {
+	if [[ -n ${KENV_SECURITY:-} ]]; then
+		# test-only: the fake security reports the lock state through show-keychain-info
+		$_kenv_sec show-keychain-info "$_kenv_kc" >/dev/null 2>&1 && print unlocked || print locked
+		return 0
+	fi
+	/usr/bin/osascript -l JavaScript - "$_kenv_kc" 2>/dev/null <<'JXA'
+ObjC.import('Security');
+function run(argv) {
+	var kc = Ref(), st = Ref();
+	if ($.SecKeychainOpen(argv[0], kc) !== 0) return 'error';
+	if ($.SecKeychainGetStatus(kc[0], st) !== 0) return 'error';
+	return (st[0] & 1) ? 'unlocked' : 'locked';   // 1 = kSecUnlockStateStatus
+}
+JXA
+}
+
 _kenv_is_unlocked() {
-	$_kenv_sec show-keychain-info "$_kenv_kc" >/dev/null 2>&1
+	[[ "$(_kenv_lock_state)" == unlocked ]]
 }
 
 # Explain why key $1 could not be read.
@@ -349,8 +369,11 @@ _kenv_cmd_status() {
 		print -r -- 'state:    not created (kenv init)'
 		exit 1
 	fi
-	local _kenv_info _kenv_t _kenv_list
-	if _kenv_info="$($_kenv_sec show-keychain-info "$_kenv_kc" 2>&1)"; then
+	local _kenv_info _kenv_t _kenv_list _kenv_state
+	_kenv_state="$(_kenv_lock_state)"
+	# show-keychain-info is only called while unlocked: when locked it opens a dialog
+	if [[ $_kenv_state == unlocked ]] &&
+		_kenv_info="$($_kenv_sec show-keychain-info "$_kenv_kc" 2>&1)"; then
 		print -r -- 'state:    unlocked'
 		# e.g. Keychain "<path>" lock-on-sleep timeout=300s
 		if [[ $_kenv_info =~ 'timeout=([0-9]+)s' ]]; then
@@ -360,9 +383,11 @@ _kenv_cmd_status() {
 		fi
 		[[ $_kenv_info == *lock-on-sleep* ]] && _kenv_t+=' and on sleep'
 		print -r -- "lock:     $_kenv_t"
-	else
+	elif [[ $_kenv_state == locked ]]; then
 		print -r -- 'state:    locked'
 		print -r -- 'lock:     timeout is shown while unlocked'
+	else
+		print -r -- 'state:    unknown (could not read the lock state)'
 	fi
 	if _kenv_list="$($_kenv_sec list-keychains -d user 2>/dev/null)" &&
 		[[ $_kenv_list == *\"$_kenv_kc\"* ]]; then
