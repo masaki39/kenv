@@ -229,8 +229,16 @@ _kenv_cmd_set() {
 	[[ $_kenv_v != *$'\n'* ]] || { _kenv_err 'value must not contain a newline'; exit 1 }
 	[[ $_kenv_v != *[^\ -~]* ]] ||
 		{ _kenv_err 'value must be printable ASCII (no tabs, control or non-ASCII characters)'; exit 1 }
-	print -r -- "add-generic-password -U -s $(_kenv_q "${_kenv_prefix}$1") -a $(_kenv_q "$_kenv_user") -X $(_kenv_hex $_kenv_v) $(_kenv_q "$_kenv_kc")" |
-		$_kenv_sec -i >/dev/null 2>&1
+	local _kenv_line _kenv_max
+	_kenv_line="add-generic-password -U -s $(_kenv_q "${_kenv_prefix}$1") -a $(_kenv_q "$_kenv_user") -X $(_kenv_hex $_kenv_v) $(_kenv_q "$_kenv_kc")"
+	# security -i cannot handle long lines (a 2048-char value, 4096 hex digits, fails), so
+	# refuse before writing anything rather than risk a half-written item
+	if (( ${#_kenv_line} > 4000 )); then
+		_kenv_max=$(( (4000 - ${#_kenv_line} + 2 * ${#_kenv_v}) / 2 ))
+		_kenv_err "value too long: ${#_kenv_v} characters (max $_kenv_max for this key); nothing was stored"
+		exit 1
+	fi
+	print -r -- "$_kenv_line" | $_kenv_sec -i >/dev/null 2>&1
 	# security -i returns 0 even on failure, so read the value back to verify
 	if [[ "$(_kenv_read_value $1)" == $_kenv_v ]]; then
 		return 0

@@ -119,7 +119,7 @@ kenv unlock          # password in the terminal (use over ssh, where no dialog a
 - If a global key and a project key have the same name, the global key wins and kenv prints a warning.
 - `kenv get` prints the value followed by a newline.
 - Key names must be valid environment variable names. `set` and `run` refuse zsh special or read-only variables (`PATH`, `HOME`, `IFS`, `LANG`, `TERM`, ...) and names starting with `_kenv_`.
-- Values must be a single line of printable ASCII (no tabs, control or non-ASCII characters), which covers API keys and tokens.
+- Values must be a single line of printable ASCII (no tabs, control or non-ASCII characters), which covers API keys and tokens. The limit is about 1900 characters (`security -i` cannot take longer lines); longer values are refused without writing anything.
 - `kenv help` lists every command; `kenv <command> -h` shows the usage of one.
 
 ### Give a command its keys automatically

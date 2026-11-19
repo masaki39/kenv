@@ -132,6 +132,13 @@ for v in $'tab\there' 'café' $'bell\a' 'キー'; do
 	err_has "non-printable value ${(q+)v}" 'printable ASCII'
 done
 k get NONASCII; is 'refused value was not written' 1
+# security -i cannot take long lines: too-long values are refused before writing
+A1K=$(printf "a%.0s" {1..1024}); A2K=$A1K$A1K
+setk LONG keep
+kin "$A1K" set LONG; is 'value of 1024 chars' 0
+kin "$A2K" set LONG; is 'value of 2048 chars' 1; err_has 'too long value' 'value too long'
+k get LONG; out 'too long value was not written' "$A1K"
+k rm LONG; is 'rm LONG' 0
 V2='q"uo\te $HOME'
 setk QUOTE "$V2"
 k get QUOTE; out 'quotes and backslashes round-trip' "$V2"
