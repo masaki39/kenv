@@ -1,0 +1,271 @@
+#!/bin/zsh
+# kenv: keep secrets in a dedicated, auto-locking macOS keychain and hand them to one
+# command at a time as environment variables.
+#
+# Two rules limit what a malicious process (e.g. an npm postinstall script) can steal:
+#   - Nothing is exported at shell startup. A key exists only in the environment of the
+#     command started by `kenv run`.
+#   - Keys live in their own keychain that locks after KENV_LOCK_AFTER seconds idle and on
+#     sleep, and that is kept out of the keychain search list.
+
+emulate -L zsh
+setopt no_unset pipe_fail
+
+KENV_VERSION=0.1.0
+readonly PREFIX='kenv:'
+readonly KC=${KENV_KEYCHAIN:-$HOME/Library/Keychains/kenv.keychain-db}
+readonly LOCK_AFTER=${KENV_LOCK_AFTER:-300}
+
+readonly RE_ENV='^[A-Za-z_][A-Za-z0-9_]*$'
+readonly RE_PROJ='^[A-Za-z0-9._-]+$'
+readonly RE_KEY='^([A-Za-z0-9._-]+/)?[A-Za-z_][A-Za-z0-9_]*$'
+
+err() { print -ru2 -- "kenv: $*" }
+usage_err() { print -ru2 -- "usage: kenv $*"; exit 2 }
+
+help() {
+	print -r -- "usage: kenv <command> [args]
+
+  init                 create the keychain (once per machine; asks for a new password)
+                       re-running only re-applies the lock settings and search-list removal
+  set <KEY>            add or update (hidden prompt on a TTY, otherwise reads stdin)
+  get <KEY>            print one value
+  rm  <KEY>            delete one key
+  rm  <PROJ>/          delete every key of a project
+  ls                   list global keys and projects (names only, never values)
+  ls <PROJ>            list the keys of a project
+  ls -a                list every stored key name, one per line
+  run [-p PROJ]... [KEY...] -- <cmd...>
+                       run cmd with those keys exported; -p PROJ exports PROJ/<KEY> as <KEY>
+  lock                 lock the keychain now
+  unlock               unlock it in the terminal (useful over ssh, where no dialog appears)
+  status               show the keychain path, lock state and lock settings
+  help                 show this help
+  version              show the version
+
+KEY is an environment variable name (e.g. OPENAI_API_KEY) or PROJ/NAME for a project key.
+
+environment:
+  KENV_KEYCHAIN    keychain file   (now: $KC)
+  KENV_LOCK_AFTER  idle seconds before it locks, applied by init   (now: $LOCK_AFTER)"
+}
+
+ready() {
+	[[ -f $KC ]] || { err "keychain not found: $KC (run: kenv init)"; exit 1 }
+}
+
+check_key() {
+	[[ $1 =~ $RE_KEY ]] || { err "invalid key name: $1 (use NAME or PROJ/NAME; NAME must be a valid env var name)"; exit 2 }
+}
+
+check_proj() {
+	[[ $1 =~ $RE_PROJ ]] || { err "invalid project name: $1"; exit 2 }
+}
+
+# Read one value; prints nothing and fails if it cannot be read.
+read_value() {
+	security find-generic-password -s "${PREFIX}$1" -a "$USER" -w "$KC" 2>/dev/null
+}
+
+# Stored key names (without the prefix), one per line. Works while locked.
+stored() {
+	security dump-keychain "$KC" 2>/dev/null |
+		sed -n "s/^ *\"svce\"<blob>=\"${PREFIX}\(.*\)\"\$/\1/p" | sort -u
+}
+
+# Put the PROJ/-prefixed key names into reply. Fails if there are none.
+proj_keys() {
+	reply=(${(M)${(f)"$(stored)"}:#$1/*})
+	(( $#reply )) || { err "no keys stored for $1/ (kenv set $1/<NAME>)"; return 1 }
+}
+
+is_unlocked() {
+	security show-keychain-info "$KC" >/dev/null 2>&1
+}
+
+# Explain why key $1 could not be read.
+read_err() {
+	if ! is_unlocked; then
+		err "cannot read $1: keychain is locked (kenv unlock)"
+	elif (( ! ${${(f)"$(stored)"}[(Ie)$1]} )); then
+		err "cannot read $1: not stored (kenv set $1)"
+	else
+		err "cannot read $1 (keychain read error)"
+	fi
+}
+
+cmd_init() {
+	local -a list
+	if [[ ! -f $KC ]]; then
+		[[ $KC == *.keychain-db ]] || { err "KENV_KEYCHAIN must end in .keychain-db: $KC"; exit 1 }
+		[[ -t 0 ]] || { err 'init: run it in a terminal (it asks for a password)'; exit 1 }
+		print -u2 'kenv: choose a password for the new keychain (do not reuse your login password)'
+		if [[ ${KC:h} == $HOME/Library/Keychains ]]; then
+			# A bare name is created in ~/Library/Keychains as <name>.keychain-db
+			security create-keychain "${KC:t:r}.keychain" || exit 1
+		else
+			security create-keychain "${KC%-db}" || exit 1
+		fi
+		[[ -f $KC ]] || { err "$KC was not created"; exit 1 }
+	fi
+	# -l: lock on sleep, -u -t: lock after that many idle seconds
+	security set-keychain-settings -l -u -t "$LOCK_AFTER" "$KC" || exit 1
+	# create-keychain (and Keychain Access) add it to the search list; drop it so other
+	# apps never query it
+	# Each line looks like `    "/path/to/x.keychain-db"`. Entries whose file does not exist
+	# are dropped too, which repairs a damaged list.
+	local p
+	for p in ${(f)"$(security list-keychains -d user |
+		sed -e 's/^[[:space:]]*"//' -e 's/"[[:space:]]*$//')"}; do
+		[[ $p != $KC && -f $p ]] && list+=($p)
+	done
+	# never set an empty search list: that would hide the login keychain
+	(( $#list )) || list=($HOME/Library/Keychains/login.keychain-db)
+	security list-keychains -d user -s $list || exit 1
+	print -u2 "kenv: ready ($KC, locks after ${LOCK_AFTER}s idle and on sleep)"
+}
+
+# The value is read with hidden input on a TTY, otherwise from stdin.
+# A value passed as an argument would show up in ps, so the command goes to `security -i`
+# via stdin. (add-generic-password -w without a value is not used: its prompt truncates
+# at 128 characters.)
+cmd_set() {
+	(( $# == 1 )) || usage_err 'set <KEY>  (value from stdin or a hidden prompt)'
+	check_key $1
+	ready
+	local v
+	if [[ -t 0 ]]; then
+		read -rs "v?$1: " || exit 1
+		print -u2
+	else
+		v="$(cat)"
+	fi
+	[[ -n $v ]] || { err 'empty value'; exit 1 }
+	[[ $v != *$'\n'* ]] || { err 'value must not contain a newline'; exit 1 }
+	print -r -- "add-generic-password -U -s \"${PREFIX}$1\" -a \"$USER\" -w \"${${v//\\/\\\\}//\"/\\\"}\" \"$KC\"" |
+		security -i >/dev/null
+	# security -i returns 0 even on failure, so read the value back to verify
+	[[ "$(read_value $1)" == "$v" ]] || { err "failed to store $1"; exit 1 }
+}
+
+cmd_get() {
+	(( $# == 1 )) || usage_err 'get <KEY>'
+	check_key $1
+	ready
+	read_value $1 || { read_err $1; exit 1 }
+}
+
+cmd_rm() {
+	(( $# == 1 )) || usage_err 'rm <KEY> | <PROJ>/'
+	ready
+	local -a keys
+	if [[ $1 == */ ]]; then
+		check_proj ${1%/}
+		proj_keys ${1%/} || exit 1
+		keys=($reply)
+	else
+		check_key $1
+		keys=($1)
+	fi
+	local k
+	for k in $keys; do
+		security delete-generic-password -s "${PREFIX}$k" -a "$USER" "$KC" >/dev/null 2>&1 ||
+			{ err "cannot delete $k (not stored, or the keychain is locked)"; exit 1 }
+	done
+}
+
+cmd_ls() {
+	(( $# <= 1 )) || usage_err 'ls [-a | PROJ]'
+	ready
+	local -a names projs pkeys
+	local p
+	names=(${(f)"$(stored)"})
+	if [[ ${1:-} == -a ]]; then
+		print -rl -- $names
+	elif [[ -n ${1:-} ]]; then
+		check_proj $1
+		proj_keys $1 || exit 1
+		print -rl -- ${reply#$1/}
+	else
+		print -rl -- ${names:#*/*}
+		projs=(${(u)${(M)names:#*/*}%%/*})
+		for p in $projs; do
+			# count outside the double quotes: inside them the array is joined first
+			pkeys=(${(M)names:#$p/*})
+			print -r -- "$p/  ($#pkeys keys)"
+		done
+	fi
+}
+
+# Export the requested keys and replace this process with cmd.
+cmd_run() {
+	local -a keys projs
+	local usage='run [-p PROJ]... [KEY...] -- <cmd...>'
+	while (( $# )) && [[ $1 != -- ]]; do
+		case $1 in
+		-p) (( $# >= 2 )) || usage_err $usage; projs+=$2; shift 2 ;;
+		-p*) projs+=${1#-p}; shift ;;
+		-*) usage_err $usage ;;
+		*) keys+=$1; shift ;;
+		esac
+	done
+	[[ ${1:-} == -- ]] && (( $# >= 2 && $#keys + $#projs > 0 )) || usage_err $usage
+	shift
+	ready
+	local p k v
+	for p in $projs; do
+		check_proj $p
+		proj_keys $p || exit 1
+		for k in $reply; do
+			v="$(read_value $k)" || { read_err $k; exit 1 }
+			export "${k#$p/}=$v"
+		done
+	done
+	for k in $keys; do
+		[[ $k =~ $RE_ENV ]] || { err "run: $k is not an env var name (use -p PROJ for project keys)"; exit 2 }
+		v="$(read_value $k)" || { read_err $k; exit 1 }
+		export "$k=$v"
+	done
+	unset v
+	exec -- "$@"
+}
+
+cmd_status() {
+	print -r -- "keychain: $KC"
+	if [[ ! -f $KC ]]; then
+		print -r -- 'state:    not created (kenv init)'
+		exit 1
+	fi
+	local info
+	if info="$(security show-keychain-info "$KC" 2>&1)"; then
+		print -r -- 'state:    unlocked'
+		# e.g. Keychain "<path>" lock-on-sleep timeout=300s
+		print -r -- "settings: ${info##*\" }"
+	else
+		print -r -- 'state:    locked'
+	fi
+	if security list-keychains -d user | command grep -qF -- "\"$KC\""; then
+		print -r -- 'warning:  the keychain is in the search list (run: kenv init)'
+	fi
+}
+
+main() {
+	local cmd=${1:-}
+	(( $# )) && shift
+	case $cmd in
+	init)    cmd_init "$@" ;;
+	set)     cmd_set "$@" ;;
+	get)     cmd_get "$@" ;;
+	rm)      cmd_rm "$@" ;;
+	ls)      cmd_ls "$@" ;;
+	run)     cmd_run "$@" ;;
+	lock)    ready; security lock-keychain "$KC" ;;
+	unlock)  ready; security unlock-keychain "$KC" ;;
+	status)  cmd_status ;;
+	help|-h|--help) help ;;
+	version|-v|--version) print -r -- "kenv $KENV_VERSION" ;;
+	*)       help >&2; exit 2 ;;
+	esac
+}
+
+main "$@"

@@ -1,0 +1,50 @@
+#compdef kenv
+# zsh completion for kenv. Key names come from `kenv ls -a` (names only, never values).
+
+_kenv_names() {
+	reply=(${(f)"$(kenv ls -a 2>/dev/null)"})
+}
+
+_kenv() {
+	local -a cmds names
+	cmds=(
+		'init:create the keychain'
+		'set:add or update a key'
+		'get:print one value'
+		'rm:delete a key or a project'
+		'ls:list key names'
+		'run:run a command with keys exported'
+		'lock:lock the keychain now'
+		'unlock:unlock it in the terminal'
+		'status:show lock state'
+		'help:show help'
+		'version:show the version'
+	)
+	if (( CURRENT == 2 )); then
+		_describe -t commands 'kenv command' cmds
+		return
+	fi
+	_kenv_names; names=($reply)
+	case $words[2] in
+	get|set)
+		(( CURRENT == 3 )) && compadd -- $names ;;
+	rm)
+		(( CURRENT == 3 )) && compadd -- $names ${(u)${(M)names:#*/*}%%/*}/ ;;
+	ls)
+		(( CURRENT == 3 )) && compadd -- -a ${(u)${(M)names:#*/*}%%/*} ;;
+	run)
+		local dd=${words[(I)--]}
+		if (( dd > 0 && dd < CURRENT )); then
+			# after --: complete the command to run
+			shift $(( dd )) words
+			(( CURRENT -= dd ))
+			_normal
+		elif [[ $words[CURRENT-1] == -p ]]; then
+			compadd -- ${(u)${(M)names:#*/*}%%/*}
+		else
+			compadd -- -p -- ${names:#*/*}
+		fi ;;
+	esac
+}
+
+_kenv "$@"
