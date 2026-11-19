@@ -19,7 +19,7 @@ emulate zsh
 setopt no_unset pipe_fail
 zmodload zsh/parameter
 
-readonly _kenv_version=0.1.1
+readonly _kenv_version=0.1.2
 readonly _kenv_prefix='kenv:'
 readonly _kenv_kc=${KENV_KEYCHAIN:-$HOME/Library/Keychains/kenv.keychain-db}
 readonly _kenv_lock_after=${KENV_LOCK_AFTER:-300}

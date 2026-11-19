@@ -61,9 +61,9 @@ ok 'help mentions KENV_KEYCHAIN' '[[ $H == *KENV_KEYCHAIN* ]]'
 ok 'help mentions how to change the timeout' '[[ $H == *"KENV_LOCK_AFTER=600 kenv init"* ]]'
 k -h;        is -h 0;     out -h "$H"
 k --help;    is --help 0; out --help "$H"
-k version;   is version 0;   out version 'kenv 0.1.1'
-k -v;        is -v 0;        out -v 'kenv 0.1.1'
-k --version; is --version 0; out --version 'kenv 0.1.1'
+k version;   is version 0;   out version 'kenv 0.1.2'
+k -v;        is -v 0;        out -v 'kenv 0.1.2'
+k --version; is --version 0; out --version 'kenv 0.1.2'
 k;           is 'no args' 2; err_has 'no args' 'usage: kenv'
 k bogus;     is 'unknown command' 2; err_has 'unknown command' 'kenv: unknown command: bogus'
 ok 'unknown command also shows help' '[[ $ERR == *"usage: kenv <command>"* ]]'
