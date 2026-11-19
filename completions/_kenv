@@ -29,12 +29,13 @@ _kenv() {
 	get|set)
 		(( CURRENT == 3 )) && compadd -- $names ;;
 	rm)
-		(( CURRENT == 3 )) && compadd -- $names ${(u)${(M)names:#*/*}%%/*}/ ;;
+		(( CURRENT == 3 )) && compadd -- $names ${^${(u)${(M)names:#*/*}%%/*}}/ ;;
 	ls)
 		(( CURRENT == 3 )) && compadd -- -a ${(u)${(M)names:#*/*}%%/*} ;;
 	run)
-		local dd=${words[(I)--]}
-		if (( dd > 0 && dd < CURRENT )); then
+		# the first --: everything after it belongs to the command being run
+		local dd=${words[(i)--]}
+		if (( dd <= $#words && dd < CURRENT )); then
 			# after --: complete the command to run
 			shift $(( dd )) words
 			(( CURRENT -= dd ))

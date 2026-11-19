@@ -1,0 +1,142 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640" role="img" aria-labelledby="t d">
+  <title id="t">kenv</title>
+  <desc id="d">kenv keeps API keys in a dedicated macOS keychain that is kept out of the search list and locks after 5 minutes idle and on sleep, and passes them to one command at a time with kenv run. The terminal shows kenv set, kenv run, kenv ls and kenv status with dummy key names.</desc>
+  <style>
+    .bg { fill: #f6f8fa; }
+    .fg { fill: #1f2328; }
+    .muted { fill: #59636e; }
+    .accent { fill: #0969da; }
+    .accent-s { stroke: #0969da; }
+    .tile { fill: #ddf4ff; }
+    .chip { fill: #ffffff; stroke: #d0d7de; }
+    .chip-t { fill: #1f2328; }
+    .glow { fill: #0969da; opacity: .06; }
+    .frame { stroke: #d0d7de; }
+    /* The terminal stays dark in both themes */
+    .term { fill: #0f141b; }
+    .bar { fill: #1b222c; }
+    .tt { fill: #e6edf3; }
+    .tm { fill: #8b949e; }
+    .tp { fill: #58a6ff; }
+    .ok { fill: #3fb950; }
+    .sans { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Helvetica, Arial, sans-serif; }
+    .mono { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; }
+
+    @media (prefers-color-scheme: dark) {
+      .bg { fill: #0d1117; }
+      .fg { fill: #f0f6fc; }
+      .muted { fill: #9198a1; }
+      .accent { fill: #4493f8; }
+      .accent-s { stroke: #4493f8; }
+      .tile { fill: #12263f; }
+      .chip { fill: #151b23; stroke: #3d444d; }
+      .chip-t { fill: #e6edf3; }
+      .glow { fill: #4493f8; opacity: .10; }
+      .frame { stroke: #3d444d; }
+      .term { fill: #010409; }
+      .bar { fill: #151b23; }
+    }
+
+    /* Plays once and stays on the final frame; without CSS animation everything is simply visible */
+    .type { animation: type 1s steps(23, end) .3s both; }
+    .line { animation: rise .35s ease-out both; }
+    .l1 { animation-delay: 1.5s; }
+    .l2 { animation-delay: 1.9s; }
+    .l3 { animation-delay: 2.3s; }
+    .l4 { animation-delay: 2.6s; }
+    .l5 { animation-delay: 2.9s; }
+    .l6 { animation-delay: 3.3s; }
+    .l7 { animation-delay: 3.6s; }
+    .l8 { animation-delay: 3.9s; }
+    .l9 { animation-delay: 4.3s; }
+    @keyframes type { from { transform: translateX(0); opacity: 1; } 99% { opacity: 1; } to { transform: translateX(230px); opacity: 0; } }
+    @keyframes rise { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+    @media (prefers-reduced-motion: reduce) {
+      .type, .line { animation: none; }
+    }
+  </style>
+  <defs>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="12" stdDeviation="16" flood-color="#000" flood-opacity=".22"/>
+    </filter>
+    <clipPath id="screen"><rect x="640" y="132" width="568" height="364"/></clipPath>
+  </defs>
+
+  <rect class="bg" width="1280" height="640"/>
+  <circle class="glow" cx="930" cy="290" r="330"/>
+
+  <!-- Title + tagline -->
+  <text class="mono muted" x="72" y="118" font-size="22">masaki39 /</text>
+  <text class="sans fg" x="68" y="196" font-size="84" font-weight="800" letter-spacing="-2">kenv</text>
+  <text class="sans muted" x="72" y="242" font-size="22">Per-command secrets in a locked macOS keychain</text>
+
+  <!-- Features -->
+  <g class="sans">
+    <g transform="translate(72 296)">
+      <rect class="tile" width="48" height="48" rx="12"/>
+      <path class="accent-s" d="M17 22 V18 a7 7 0 0 1 14 0 V22" fill="none" stroke-width="3.2" stroke-linecap="round"/>
+      <rect class="accent" x="13" y="21" width="22" height="17" rx="4"/>
+      <text class="fg" x="68" y="20" font-size="22" font-weight="700">Dedicated keychain</text>
+      <text class="muted" x="68" y="46" font-size="17">Its own password, kept out of the search list</text>
+    </g>
+    <g transform="translate(72 380)">
+      <rect class="tile" width="48" height="48" rx="12"/>
+      <path class="accent-s" d="M12 24 H33" fill="none" stroke-width="3.2" stroke-linecap="round"/>
+      <path class="accent" d="M30 16 L39 24 L30 32 Z"/>
+      <text class="fg" x="68" y="20" font-size="22" font-weight="700">One command at a time</text>
+      <text class="muted" x="68" y="46" font-size="17"><tspan class="mono">kenv run KEY -- cmd</tspan> → only cmd sees it</text>
+    </g>
+    <g transform="translate(72 464)">
+      <rect class="tile" width="48" height="48" rx="12"/>
+      <circle class="accent-s" cx="24" cy="24" r="12" fill="none" stroke-width="3.2"/>
+      <path class="accent-s" d="M24 17 V24 L29 28" fill="none" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/>
+      <text class="fg" x="68" y="20" font-size="22" font-weight="700">Auto-locks</text>
+      <text class="muted" x="68" y="46" font-size="17">After 5 min idle and on sleep</text>
+    </g>
+  </g>
+
+  <!-- Terminal -->
+  <rect class="term" filter="url(#shadow)" x="640" y="96" width="568" height="400" rx="14"/>
+  <rect class="term" x="640" y="96" width="568" height="400" rx="14"/>
+  <path class="bar" d="M654 96 H1194 a14 14 0 0 1 14 14 V132 H640 V110 a14 14 0 0 1 14 -14 Z"/>
+  <rect class="frame" x="640.5" y="96.5" width="567" height="399" rx="13.5" fill="none"/>
+  <circle cx="664" cy="114" r="6.5" fill="#ff5f57"/>
+  <circle cx="686" cy="114" r="6.5" fill="#febc2e"/>
+  <circle cx="708" cy="114" r="6.5" fill="#28c840"/>
+  <text class="sans tm" x="924" y="119" font-size="14" text-anchor="middle">zsh — ~/app</text>
+
+  <!-- Output lines are kenv's real output (columns aligned with x); key names are dummies -->
+  <g class="mono" font-size="16" clip-path="url(#screen)">
+    <text x="664" y="166"><tspan class="tp">~/app</tspan><tspan class="ok"> ❯ </tspan><tspan class="tt">kenv set OPENAI_API_KEY</tspan></text>
+    <rect class="term type" opacity="0" x="740" y="150" width="230" height="22"/>
+    <text class="line l1 tt" x="664" y="195">OPENAI_API_KEY:</text>
+    <text class="line l2" x="664" y="224"><tspan class="tp">~/app</tspan><tspan class="ok"> ❯ </tspan><tspan class="tt">kenv run OPENAI_API_KEY -- python main.py</tspan></text>
+    <text class="line l3" x="664" y="253"><tspan class="tp">~/app</tspan><tspan class="ok"> ❯ </tspan><tspan class="tt">kenv ls</tspan></text>
+    <g class="line l4 tt">
+      <text x="664" y="282">OPENAI_API_KEY</text>
+      <text x="664" y="311">projA/<tspan x="741">(2 keys)</tspan></text>
+    </g>
+    <text class="line l5" x="664" y="340"><tspan class="tp">~/app</tspan><tspan class="ok"> ❯ </tspan><tspan class="tt">kenv status</tspan></text>
+    <g class="line l6">
+      <text x="664" y="369"><tspan class="tm">keychain:</tspan><tspan class="tt" x="760">~/Library/Keychains/kenv.keychain-db</tspan></text>
+    </g>
+    <g class="line l7">
+      <text x="664" y="398"><tspan class="tm">state:</tspan><tspan class="ok" x="760">unlocked</tspan></text>
+    </g>
+    <g class="line l8">
+      <text x="664" y="427"><tspan class="tm">lock:</tspan><tspan class="tt" x="760">after 300s idle and on sleep</tspan></text>
+    </g>
+    <g class="line l9">
+      <text x="664" y="464"><tspan class="tp">~/app</tspan><tspan class="ok"> ❯ </tspan></text>
+      <rect x="741" y="450" width="10" height="19" fill="#e6edf3" opacity=".85"/>
+    </g>
+  </g>
+
+  <!-- Tool stack -->
+  <g class="mono" font-size="16" text-anchor="middle">
+    <g transform="translate(354 548)"><rect class="chip" x=".5" y=".5" width="163" height="35" rx="17.5"/><text class="chip-t" x="82" y="23">macOS Keychain</text></g>
+    <g transform="translate(531 548)"><rect class="chip" x=".5" y=".5" width="65" height="35" rx="17.5"/><text class="chip-t" x="33" y="23">zsh</text></g>
+    <g transform="translate(610 548)"><rect class="chip" x=".5" y=".5" width="195" height="35" rx="17.5"/><text class="chip-t" x="98" y="23">/usr/bin/security</text></g>
+    <g transform="translate(819 548)"><rect class="chip" x=".5" y=".5" width="107" height="35" rx="17.5"/><text class="chip-t" x="54" y="23">Homebrew</text></g>
+  </g>
+</svg>

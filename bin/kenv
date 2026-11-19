@@ -1,271 +1,397 @@
-#!/bin/zsh
+#!/bin/zsh -f
 # kenv: keep secrets in a dedicated, auto-locking macOS keychain and hand them to one
 # command at a time as environment variables.
 #
-# Two rules limit what a malicious process (e.g. an npm postinstall script) can steal:
+# Threat model (what this does and does not protect):
 #   - Nothing is exported at shell startup. A key exists only in the environment of the
-#     command started by `kenv run`.
+#     command started by `kenv run` (and its children) while it runs.
 #   - Keys live in their own keychain that locks after KENV_LOCK_AFTER seconds idle and on
 #     sleep, and that is kept out of the keychain search list.
+#   - While the keychain is locked, reading a key needs its password.
+#   - While it is UNLOCKED, any process running as you that can call /usr/bin/security can
+#     read every key without a prompt: items are created by /usr/bin/security, so the
+#     default ACL trusts it. kenv does not protect against malware running as you during
+#     that window.
+#
+# -f: do not read ~/.zshenv, so the user's aliases and functions cannot change this script.
 
-emulate -L zsh
+emulate zsh
 setopt no_unset pipe_fail
+zmodload zsh/parameter
 
-KENV_VERSION=0.1.0
-readonly PREFIX='kenv:'
-readonly KC=${KENV_KEYCHAIN:-$HOME/Library/Keychains/kenv.keychain-db}
-readonly LOCK_AFTER=${KENV_LOCK_AFTER:-300}
+readonly _kenv_version=0.1.0
+readonly _kenv_prefix='kenv:'
+readonly _kenv_kc=${KENV_KEYCHAIN:-$HOME/Library/Keychains/kenv.keychain-db}
+readonly _kenv_lock_after=${KENV_LOCK_AFTER:-300}
+readonly _kenv_user=${USER:-$(id -un)}
+# KENV_SECURITY is for the test suite only (tests/test.zsh points it at a fake). Normal
+# use always runs /usr/bin/security.
+readonly _kenv_sec=${KENV_SECURITY:-/usr/bin/security}
 
-readonly RE_ENV='^[A-Za-z_][A-Za-z0-9_]*$'
-readonly RE_PROJ='^[A-Za-z0-9._-]+$'
-readonly RE_KEY='^([A-Za-z0-9._-]+/)?[A-Za-z_][A-Za-z0-9_]*$'
+readonly _kenv_re_env='^[A-Za-z_][A-Za-z0-9_]*$'
+readonly _kenv_re_proj='^[A-Za-z0-9._-]+$'
+readonly _kenv_re_key='^([A-Za-z0-9._-]+/)?[A-Za-z_][A-Za-z0-9_]*$'
 
-err() { print -ru2 -- "kenv: $*" }
-usage_err() { print -ru2 -- "usage: kenv $*"; exit 2 }
+# Per-command usage: syntax and a one-line description (kenv <cmd> -h).
+typeset -gA _kenv_syn=(
+	init   'init'
+	set    'set <KEY>'
+	get    'get <KEY>'
+	rm     'rm <KEY> | <PROJ>/'
+	ls     'ls [-a | PROJ]'
+	run    'run [-p PROJ]... [KEY]... -- <cmd...>'
+	lock   'lock'
+	unlock 'unlock'
+	status 'status'
+)
+typeset -gA _kenv_desc=(
+	init   'create the keychain, or re-apply its lock settings (KENV_LOCK_AFTER)'
+	set    'store a value (hidden prompt on a TTY, otherwise read from stdin)'
+	get    'print a value, followed by a newline'
+	rm     'delete a key, or every key of a project'
+	ls     'list global keys and projects, every key (-a), or the keys of PROJ; never values'
+	run    'run cmd with only those keys exported; -p PROJ passes every PROJ/NAME as NAME'
+	lock   'lock the keychain now'
+	unlock 'unlock it in the terminal (useful over ssh, where no dialog appears)'
+	status 'show the keychain path, lock state and idle timeout'
+)
 
-help() {
+_kenv_err() { print -ru2 -- "kenv: $*" }
+_kenv_usage_err() { print -ru2 -- "usage: kenv $_kenv_syn[$1]"; exit 2 }
+
+_kenv_help() {
 	print -r -- "usage: kenv <command> [args]
-
-  init                 create the keychain (once per machine; asks for a new password)
-                       re-running only re-applies the lock settings and search-list removal
-  set <KEY>            add or update (hidden prompt on a TTY, otherwise reads stdin)
-  get <KEY>            print one value
-  rm  <KEY>            delete one key
-  rm  <PROJ>/          delete every key of a project
-  ls                   list global keys and projects (names only, never values)
-  ls <PROJ>            list the keys of a project
-  ls -a                list every stored key name, one per line
-  run [-p PROJ]... [KEY...] -- <cmd...>
-                       run cmd with those keys exported; -p PROJ exports PROJ/<KEY> as <KEY>
-  lock                 lock the keychain now
-  unlock               unlock it in the terminal (useful over ssh, where no dialog appears)
-  status               show the keychain path, lock state and lock settings
-  help                 show this help
-  version              show the version
-
-KEY is an environment variable name (e.g. OPENAI_API_KEY) or PROJ/NAME for a project key.
-
-environment:
-  KENV_KEYCHAIN    keychain file   (now: $KC)
-  KENV_LOCK_AFTER  idle seconds before it locks, applied by init   (now: $LOCK_AFTER)"
+  init                     create the keychain, or re-apply its lock settings
+  set <KEY>                store a value (hidden prompt, or stdin)
+  get <KEY>                print a value (with a trailing newline)
+  rm <KEY> | <PROJ>/       delete a key, or every key of a project
+  ls [-a | PROJ]           list key names (never values)
+  run [-p PROJ]... [KEY]... -- <cmd...>   run cmd with only those keys exported
+  lock | unlock | status   lock now / unlock in the terminal / show state
+  help | version
+KEY is an env var name or PROJ/NAME; -p PROJ passes every PROJ/NAME as NAME.
+env: KENV_KEYCHAIN    keychain file (now: $_kenv_kc)
+     KENV_LOCK_AFTER  idle seconds before it locks (now: $_kenv_lock_after; change: KENV_LOCK_AFTER=600 kenv init)"
 }
 
-ready() {
-	[[ -f $KC ]] || { err "keychain not found: $KC (run: kenv init)"; exit 1 }
+_kenv_check_kc() {
+	[[ $_kenv_kc == /* ]] || { _kenv_err "KENV_KEYCHAIN must be an absolute path: $_kenv_kc"; exit 2 }
 }
 
-check_key() {
-	[[ $1 =~ $RE_KEY ]] || { err "invalid key name: $1 (use NAME or PROJ/NAME; NAME must be a valid env var name)"; exit 2 }
+_kenv_ready() {
+	_kenv_check_kc
+	[[ -f $_kenv_kc ]] || { _kenv_err "keychain not found: $_kenv_kc (run: kenv init)"; exit 1 }
 }
 
-check_proj() {
-	[[ $1 =~ $RE_PROJ ]] || { err "invalid project name: $1"; exit 2 }
+# Env var names kenv refuses: zsh special or read-only parameters (PATH, HOME, IFS,
+# status, ...), which would break the shell before exec, and kenv's own _kenv_ names.
+_kenv_check_name() {
+	local _kenv_t=${parameters[$1]-}
+	if [[ $1 == _kenv_* || $_kenv_t == *special* || $_kenv_t == *readonly* ]]; then
+		_kenv_err "reserved name: $1 (zsh special/read-only variable or _kenv_ prefix)"
+		exit 2
+	fi
+}
+
+# Syntax only. Reserved names are checked by set and run, so a key stored under a name
+# that a later zsh reserves can still be read and deleted.
+_kenv_check_key() {
+	[[ $1 =~ $_kenv_re_key ]] ||
+		{ _kenv_err "invalid key name: $1 (use NAME or PROJ/NAME; NAME must be a valid env var name)"; exit 2 }
+}
+
+_kenv_check_proj() {
+	[[ $1 =~ $_kenv_re_proj ]] || { _kenv_err "invalid project name: $1"; exit 2 }
 }
 
 # Read one value; prints nothing and fails if it cannot be read.
-read_value() {
-	security find-generic-password -s "${PREFIX}$1" -a "$USER" -w "$KC" 2>/dev/null
+_kenv_read_value() {
+	$_kenv_sec find-generic-password -s "${_kenv_prefix}$1" -a "$_kenv_user" -w "$_kenv_kc" 2>/dev/null
 }
 
-# Stored key names (without the prefix), one per line. Works while locked.
-stored() {
-	security dump-keychain "$KC" 2>/dev/null |
-		sed -n "s/^ *\"svce\"<blob>=\"${PREFIX}\(.*\)\"\$/\1/p" | sort -u
+# Put the stored key names (without the prefix) into _kenv_names. Works while locked.
+_kenv_load_names() {
+	local _kenv_dump
+	_kenv_dump="$($_kenv_sec dump-keychain "$_kenv_kc" 2>/dev/null)" ||
+		{ _kenv_err "cannot list the keys in $_kenv_kc"; exit 1 }
+	_kenv_names=(${(f)"$(print -r -- $_kenv_dump |
+		sed -n "s/^ *\"svce\"<blob>=\"${_kenv_prefix}\(.*\)\"\$/\1/p" | sort -u)"})
 }
 
-# Put the PROJ/-prefixed key names into reply. Fails if there are none.
-proj_keys() {
-	reply=(${(M)${(f)"$(stored)"}:#$1/*})
-	(( $#reply )) || { err "no keys stored for $1/ (kenv set $1/<NAME>)"; return 1 }
+# Put the PROJ/-prefixed key names into _kenv_reply. Fails if there are none.
+_kenv_proj_keys() {
+	_kenv_load_names
+	_kenv_reply=(${(M)_kenv_names:#$1/*})
+	(( $#_kenv_reply )) || { _kenv_err "no keys stored for $1/ (kenv set $1/<NAME>)"; return 1 }
 }
 
-is_unlocked() {
-	security show-keychain-info "$KC" >/dev/null 2>&1
+_kenv_is_unlocked() {
+	$_kenv_sec show-keychain-info "$_kenv_kc" >/dev/null 2>&1
 }
 
 # Explain why key $1 could not be read.
-read_err() {
-	if ! is_unlocked; then
-		err "cannot read $1: keychain is locked (kenv unlock)"
-	elif (( ! ${${(f)"$(stored)"}[(Ie)$1]} )); then
-		err "cannot read $1: not stored (kenv set $1)"
+_kenv_read_err() {
+	if ! _kenv_is_unlocked; then
+		_kenv_err "cannot read $1: keychain is locked (kenv unlock)"
+		return
+	fi
+	_kenv_load_names
+	if (( ! _kenv_names[(Ie)$1] )); then
+		_kenv_err "cannot read $1: not stored (kenv set $1)"
 	else
-		err "cannot read $1 (keychain read error)"
+		_kenv_err "cannot read $1 (keychain read error)"
 	fi
 }
 
-cmd_init() {
-	local -a list
-	if [[ ! -f $KC ]]; then
-		[[ $KC == *.keychain-db ]] || { err "KENV_KEYCHAIN must end in .keychain-db: $KC"; exit 1 }
-		[[ -t 0 ]] || { err 'init: run it in a terminal (it asks for a password)'; exit 1 }
+# Quote a string for one argument of a `security -i` command line.
+_kenv_q() { print -rn -- "\"${${1//\\/\\\\}//\"/\\\"}\"" }
+
+# Lower-case hex of the bytes of $1.
+_kenv_hex() { print -rn -- "$1" | od -An -v -tx1 | tr -d ' \n' }
+
+_kenv_cmd_init() {
+	(( $# == 0 )) || _kenv_usage_err init
+	_kenv_check_kc
+	[[ $_kenv_lock_after == <1-> ]] ||
+		{ _kenv_err "KENV_LOCK_AFTER must be a positive number of seconds: $_kenv_lock_after"; exit 2 }
+	if [[ ! -f $_kenv_kc ]]; then
+		[[ $_kenv_kc == *.keychain-db ]] || { _kenv_err "KENV_KEYCHAIN must end in .keychain-db: $_kenv_kc"; exit 1 }
+		[[ -t 0 ]] || { _kenv_err 'init: run it in a terminal (it asks for a password)'; exit 1 }
 		print -u2 'kenv: choose a password for the new keychain (do not reuse your login password)'
-		if [[ ${KC:h} == $HOME/Library/Keychains ]]; then
+		if [[ ${_kenv_kc:h} == $HOME/Library/Keychains ]]; then
 			# A bare name is created in ~/Library/Keychains as <name>.keychain-db
-			security create-keychain "${KC:t:r}.keychain" || exit 1
+			$_kenv_sec create-keychain "${_kenv_kc:t:r}.keychain" || exit 1
 		else
-			security create-keychain "${KC%-db}" || exit 1
+			$_kenv_sec create-keychain "${_kenv_kc%-db}" || exit 1
 		fi
-		[[ -f $KC ]] || { err "$KC was not created"; exit 1 }
+		[[ -f $_kenv_kc ]] || { _kenv_err "$_kenv_kc was not created"; exit 1 }
 	fi
 	# -l: lock on sleep, -u -t: lock after that many idle seconds
-	security set-keychain-settings -l -u -t "$LOCK_AFTER" "$KC" || exit 1
+	$_kenv_sec set-keychain-settings -l -u -t "$_kenv_lock_after" "$_kenv_kc" || exit 1
 	# create-keychain (and Keychain Access) add it to the search list; drop it so other
-	# apps never query it
-	# Each line looks like `    "/path/to/x.keychain-db"`. Entries whose file does not exist
-	# are dropped too, which repairs a damaged list.
-	local p
-	for p in ${(f)"$(security list-keychains -d user |
+	# apps never query it. Each line looks like `    "/path/to/x.keychain-db"`.
+	# Entries whose file does not exist are dropped too, which repairs a damaged list;
+	# an old-style name (login.keychain) counts as existing when its -db file does.
+	local _kenv_out _kenv_p
+	local -a _kenv_list
+	_kenv_out="$($_kenv_sec list-keychains -d user)" ||
+		{ _kenv_err 'cannot read the keychain search list'; exit 1 }
+	for _kenv_p in ${(f)"$(print -r -- $_kenv_out |
 		sed -e 's/^[[:space:]]*"//' -e 's/"[[:space:]]*$//')"}; do
-		[[ $p != $KC && -f $p ]] && list+=($p)
+		[[ $_kenv_p != $_kenv_kc && ( -f $_kenv_p || -f ${_kenv_p}-db ) ]] && _kenv_list+=($_kenv_p)
 	done
 	# never set an empty search list: that would hide the login keychain
-	(( $#list )) || list=($HOME/Library/Keychains/login.keychain-db)
-	security list-keychains -d user -s $list || exit 1
-	print -u2 "kenv: ready ($KC, locks after ${LOCK_AFTER}s idle and on sleep)"
+	(( $#_kenv_list )) || _kenv_list=($HOME/Library/Keychains/login.keychain-db)
+	$_kenv_sec list-keychains -d user -s $_kenv_list || exit 1
+	print -u2 "kenv: ready ($_kenv_kc, locks after ${_kenv_lock_after}s idle and on sleep)"
 }
 
 # The value is read with hidden input on a TTY, otherwise from stdin.
 # A value passed as an argument would show up in ps, so the command goes to `security -i`
-# via stdin. (add-generic-password -w without a value is not used: its prompt truncates
-# at 128 characters.)
-cmd_set() {
-	(( $# == 1 )) || usage_err 'set <KEY>  (value from stdin or a hidden prompt)'
-	check_key $1
-	ready
-	local v
+# via stdin, with the value as hex (-X) so no character needs quoting.
+# Only printable ASCII is accepted: find-generic-password -w prints any other value as
+# hex, which get/run could not tell apart from a real value.
+# (add-generic-password -w without a value is not used: its prompt truncates at 128
+# characters.)
+_kenv_cmd_set() {
+	(( $# == 1 )) || _kenv_usage_err set
+	_kenv_check_key $1
+	_kenv_check_name ${1##*/}
+	_kenv_ready
+	local _kenv_v
 	if [[ -t 0 ]]; then
-		read -rs "v?$1: " || exit 1
+		read -rs "_kenv_v?$1: " || exit 1
 		print -u2
 	else
-		v="$(cat)"
+		_kenv_v="$(cat)"
 	fi
-	[[ -n $v ]] || { err 'empty value'; exit 1 }
-	[[ $v != *$'\n'* ]] || { err 'value must not contain a newline'; exit 1 }
-	print -r -- "add-generic-password -U -s \"${PREFIX}$1\" -a \"$USER\" -w \"${${v//\\/\\\\}//\"/\\\"}\" \"$KC\"" |
-		security -i >/dev/null
+	[[ -n $_kenv_v ]] || { _kenv_err 'empty value'; exit 1 }
+	[[ $_kenv_v != *$'\n'* ]] || { _kenv_err 'value must not contain a newline'; exit 1 }
+	[[ $_kenv_v != *[^\ -~]* ]] ||
+		{ _kenv_err 'value must be printable ASCII (no tabs, control or non-ASCII characters)'; exit 1 }
+	print -r -- "add-generic-password -U -s $(_kenv_q "${_kenv_prefix}$1") -a $(_kenv_q "$_kenv_user") -X $(_kenv_hex $_kenv_v) $(_kenv_q "$_kenv_kc")" |
+		$_kenv_sec -i >/dev/null 2>&1
 	# security -i returns 0 even on failure, so read the value back to verify
-	[[ "$(read_value $1)" == "$v" ]] || { err "failed to store $1"; exit 1 }
-}
-
-cmd_get() {
-	(( $# == 1 )) || usage_err 'get <KEY>'
-	check_key $1
-	ready
-	read_value $1 || { read_err $1; exit 1 }
-}
-
-cmd_rm() {
-	(( $# == 1 )) || usage_err 'rm <KEY> | <PROJ>/'
-	ready
-	local -a keys
-	if [[ $1 == */ ]]; then
-		check_proj ${1%/}
-		proj_keys ${1%/} || exit 1
-		keys=($reply)
+	if [[ "$(_kenv_read_value $1)" == $_kenv_v ]]; then
+		return 0
+	elif ! _kenv_is_unlocked; then
+		_kenv_err "failed to store $1: keychain is locked (kenv unlock)"
 	else
-		check_key $1
-		keys=($1)
+		_kenv_err "failed to store $1; a value already stored under $1 may have been changed (check: kenv get $1)"
 	fi
-	local k
-	for k in $keys; do
-		security delete-generic-password -s "${PREFIX}$k" -a "$USER" "$KC" >/dev/null 2>&1 ||
-			{ err "cannot delete $k (not stored, or the keychain is locked)"; exit 1 }
+	exit 1
+}
+
+_kenv_cmd_get() {
+	(( $# == 1 )) || _kenv_usage_err get
+	_kenv_check_key $1
+	_kenv_ready
+	_kenv_read_value $1 || { _kenv_read_err $1; exit 1 }
+}
+
+_kenv_cmd_rm() {
+	(( $# == 1 )) || _kenv_usage_err rm
+	local -a _kenv_keys
+	if [[ $1 == */ ]]; then
+		_kenv_check_proj ${1%/}
+		_kenv_ready
+		_kenv_proj_keys ${1%/} || exit 1
+		_kenv_keys=($_kenv_reply)
+	else
+		_kenv_check_key $1
+		_kenv_ready
+		_kenv_keys=($1)
+	fi
+	local _kenv_k
+	integer _kenv_n=0
+	for _kenv_k in $_kenv_keys; do
+		if ! $_kenv_sec delete-generic-password -s "${_kenv_prefix}$_kenv_k" -a "$_kenv_user" "$_kenv_kc" >/dev/null 2>&1; then
+			local _kenv_done=
+			(( $#_kenv_keys > 1 )) && _kenv_done="; deleted $_kenv_n of $#_kenv_keys"
+			_kenv_err "cannot delete $_kenv_k (not stored, or the keychain is locked)$_kenv_done"
+			exit 1
+		fi
+		_kenv_n+=1
 	done
 }
 
-cmd_ls() {
-	(( $# <= 1 )) || usage_err 'ls [-a | PROJ]'
-	ready
-	local -a names projs pkeys
-	local p
-	names=(${(f)"$(stored)"})
+_kenv_cmd_ls() {
+	(( $# <= 1 )) || _kenv_usage_err ls
+	[[ ${1:-} == (-a|) ]] || _kenv_check_proj $1
+	_kenv_ready
+	local -a _kenv_out _kenv_projs _kenv_pkeys
+	local _kenv_p
 	if [[ ${1:-} == -a ]]; then
-		print -rl -- $names
+		_kenv_load_names
+		_kenv_out=($_kenv_names)
 	elif [[ -n ${1:-} ]]; then
-		check_proj $1
-		proj_keys $1 || exit 1
-		print -rl -- ${reply#$1/}
+		_kenv_proj_keys $1 || exit 1
+		_kenv_out=(${_kenv_reply#$1/})
 	else
-		print -rl -- ${names:#*/*}
-		projs=(${(u)${(M)names:#*/*}%%/*})
-		for p in $projs; do
-			# count outside the double quotes: inside them the array is joined first
-			pkeys=(${(M)names:#$p/*})
-			print -r -- "$p/  ($#pkeys keys)"
+		_kenv_load_names
+		_kenv_out=(${_kenv_names:#*/*})
+		_kenv_projs=(${(u)${(M)_kenv_names:#*/*}%%/*})
+		for _kenv_p in $_kenv_projs; do
+			_kenv_pkeys=(${(M)_kenv_names:#$_kenv_p/*})
+			if (( $#_kenv_pkeys == 1 )); then
+				_kenv_out+=("$_kenv_p/  (1 key)")
+			else
+				_kenv_out+=("$_kenv_p/  ($#_kenv_pkeys keys)")
+			fi
 		done
 	fi
+	(( $#_kenv_out )) && print -rl -- $_kenv_out
+	return 0
 }
 
-# Export the requested keys and replace this process with cmd.
-cmd_run() {
-	local -a keys projs
-	local usage='run [-p PROJ]... [KEY...] -- <cmd...>'
+# Read every requested key first, then export them all and replace this process with
+# cmd. Nothing is exported until all reads succeeded, and only _kenv_ variables are
+# used here, so a key name can never clobber kenv's own state.
+_kenv_cmd_run() {
+	local -a _kenv_keys _kenv_projs
 	while (( $# )) && [[ $1 != -- ]]; do
 		case $1 in
-		-p) (( $# >= 2 )) || usage_err $usage; projs+=$2; shift 2 ;;
-		-p*) projs+=${1#-p}; shift ;;
-		-*) usage_err $usage ;;
-		*) keys+=$1; shift ;;
+		-p) (( $# >= 2 )) || _kenv_usage_err run; _kenv_projs+=$2; shift 2 ;;
+		-p*) _kenv_projs+=${1#-p}; shift ;;
+		-*) _kenv_usage_err run ;;
+		*) _kenv_keys+=$1; shift ;;
 		esac
 	done
-	[[ ${1:-} == -- ]] && (( $# >= 2 && $#keys + $#projs > 0 )) || usage_err $usage
+	[[ ${1:-} == -- ]] && (( $# >= 2 && $#_kenv_keys + $#_kenv_projs > 0 )) || _kenv_usage_err run
 	shift
-	ready
-	local p k v
-	for p in $projs; do
-		check_proj $p
-		proj_keys $p || exit 1
-		for k in $reply; do
-			v="$(read_value $k)" || { read_err $k; exit 1 }
-			export "${k#$p/}=$v"
+	local _kenv_p _kenv_k _kenv_n _kenv_v
+	for _kenv_p in $_kenv_projs; do _kenv_check_proj $_kenv_p; done
+	for _kenv_k in $_kenv_keys; do
+		[[ $_kenv_k =~ $_kenv_re_env ]] ||
+			{ _kenv_err "run: $_kenv_k is not an env var name (use -p PROJ for project keys)"; exit 2 }
+		_kenv_check_name $_kenv_k
+	done
+	_kenv_ready
+
+	# env name -> value, and env name -> stored key it came from
+	local -A _kenv_vals _kenv_from
+	local -a _kenv_todo   # pairs: stored key, env name
+	for _kenv_p in $_kenv_projs; do
+		_kenv_proj_keys $_kenv_p || exit 1
+		for _kenv_k in $_kenv_reply; do
+			_kenv_n=${_kenv_k#$_kenv_p/}
+			_kenv_check_name $_kenv_n
+			_kenv_todo+=($_kenv_k $_kenv_n)
 		done
 	done
-	for k in $keys; do
-		[[ $k =~ $RE_ENV ]] || { err "run: $k is not an env var name (use -p PROJ for project keys)"; exit 2 }
-		v="$(read_value $k)" || { read_err $k; exit 1 }
-		export "$k=$v"
+	for _kenv_k in $_kenv_keys; do _kenv_todo+=($_kenv_k $_kenv_k); done
+	for _kenv_k _kenv_n in $_kenv_todo; do
+		_kenv_v="$(_kenv_read_value $_kenv_k)" || { _kenv_read_err $_kenv_k; exit 1 }
+		if (( ${+_kenv_from[$_kenv_n]} )) && [[ $_kenv_from[$_kenv_n] != $_kenv_k ]]; then
+			_kenv_err "warning: $_kenv_n from $_kenv_from[$_kenv_n] is overridden by $_kenv_k"
+		fi
+		_kenv_vals[$_kenv_n]=$_kenv_v
+		_kenv_from[$_kenv_n]=$_kenv_k
 	done
-	unset v
+	_kenv_v=
+	# unset first: a variable of the same name may exist in this shell with a type (e.g.
+	# the integer MBEGIN/MEND set by =~), which would evaluate the value as arithmetic.
+	# Special and read-only names were refused above, so unset is safe.
+	for _kenv_n in ${(k)_kenv_vals}; do
+		unset -- $_kenv_n
+		export -- "$_kenv_n=$_kenv_vals[$_kenv_n]"
+	done
 	exec -- "$@"
 }
 
-cmd_status() {
-	print -r -- "keychain: $KC"
-	if [[ ! -f $KC ]]; then
+_kenv_cmd_status() {
+	(( $# == 0 )) || _kenv_usage_err status
+	_kenv_check_kc
+	local _kenv_disp=$_kenv_kc
+	[[ $_kenv_kc == $HOME/* ]] && _kenv_disp="~/${_kenv_kc#$HOME/}"
+	print -r -- "keychain: $_kenv_disp"
+	if [[ ! -f $_kenv_kc ]]; then
 		print -r -- 'state:    not created (kenv init)'
 		exit 1
 	fi
-	local info
-	if info="$(security show-keychain-info "$KC" 2>&1)"; then
+	local _kenv_info _kenv_t _kenv_list
+	if _kenv_info="$($_kenv_sec show-keychain-info "$_kenv_kc" 2>&1)"; then
 		print -r -- 'state:    unlocked'
 		# e.g. Keychain "<path>" lock-on-sleep timeout=300s
-		print -r -- "settings: ${info##*\" }"
+		if [[ $_kenv_info =~ 'timeout=([0-9]+)s' ]]; then
+			_kenv_t="after ${match[1]}s idle"
+		else
+			_kenv_t='no idle timeout'
+		fi
+		[[ $_kenv_info == *lock-on-sleep* ]] && _kenv_t+=' and on sleep'
+		print -r -- "lock:     $_kenv_t"
 	else
 		print -r -- 'state:    locked'
+		print -r -- 'lock:     timeout is shown while unlocked'
 	fi
-	if security list-keychains -d user | command grep -qF -- "\"$KC\""; then
+	if _kenv_list="$($_kenv_sec list-keychains -d user 2>/dev/null)" &&
+		[[ $_kenv_list == *\"$_kenv_kc\"* ]]; then
 		print -r -- 'warning:  the keychain is in the search list (run: kenv init)'
 	fi
+	return 0
 }
 
-main() {
-	local cmd=${1:-}
+_kenv_main() {
+	local _kenv_cmd=${1:-}
 	(( $# )) && shift
-	case $cmd in
-	init)    cmd_init "$@" ;;
-	set)     cmd_set "$@" ;;
-	get)     cmd_get "$@" ;;
-	rm)      cmd_rm "$@" ;;
-	ls)      cmd_ls "$@" ;;
-	run)     cmd_run "$@" ;;
-	lock)    ready; security lock-keychain "$KC" ;;
-	unlock)  ready; security unlock-keychain "$KC" ;;
-	status)  cmd_status ;;
-	help|-h|--help) help ;;
-	version|-v|--version) print -r -- "kenv $KENV_VERSION" ;;
-	*)       help >&2; exit 2 ;;
+	if (( ${+_kenv_syn[$_kenv_cmd]} )) && [[ ${1:-} == (-h|--help) ]]; then
+		print -rl -- "usage: kenv $_kenv_syn[$_kenv_cmd]" "  $_kenv_desc[$_kenv_cmd]"
+		return 0
+	fi
+	case $_kenv_cmd in
+	init)    _kenv_cmd_init "$@" ;;
+	set)     _kenv_cmd_set "$@" ;;
+	get)     _kenv_cmd_get "$@" ;;
+	rm)      _kenv_cmd_rm "$@" ;;
+	ls)      _kenv_cmd_ls "$@" ;;
+	run)     _kenv_cmd_run "$@" ;;
+	lock)    (( $# == 0 )) || _kenv_usage_err lock; _kenv_ready; $_kenv_sec lock-keychain "$_kenv_kc" ;;
+	unlock)  (( $# == 0 )) || _kenv_usage_err unlock; _kenv_ready; $_kenv_sec unlock-keychain "$_kenv_kc" ;;
+	status)  _kenv_cmd_status "$@" ;;
+	help|-h|--help) _kenv_help ;;
+	version|-v|--version) print -r -- "kenv $_kenv_version" ;;
+	*)       [[ -n $_kenv_cmd ]] && _kenv_err "unknown command: $_kenv_cmd"; _kenv_help >&2; exit 2 ;;
 	esac
 }
 
-main "$@"
+_kenv_main "$@"

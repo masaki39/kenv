@@ -1,0 +1,98 @@
+#!/bin/zsh -f
+# Test double for /usr/bin/security, used by tests/test.zsh through KENV_SECURITY.
+# It never calls the real security command. State lives in $FAKE_SEC_DIR:
+#   items/<hex>       raw value of a generic password; the file name is the service name
+#                     in hex (one account only; hex because macOS file names ignore case)
+#   locked            present while the keychain is locked
+#   timeout           idle timeout set by set-keychain-settings
+#   searchlist        one path per line (list-keychains -d user)
+#   log               one line per call
+emulate zsh
+setopt extended_glob no_unset
+: ${FAKE_SEC_DIR:?}
+D=$FAKE_SEC_DIR
+mkdir -p $D/items
+print -r -- "$*" >> $D/log
+
+tohex() { print -rn -- "$1" | od -An -v -tx1 | tr -d ' \n' }
+fromhex() { printf '%b' "${1//(#m)??/\\x$MATCH}" }
+item() { print -r -- "$D/items/$(tohex $1)" }
+
+opt() {  # value of option $1 in the remaining args
+	local o=$1; shift
+	while (( $# )); do [[ $1 == $o ]] && { print -r -- $2; return }; shift; done
+	return 1
+}
+
+locked() { [[ -e $D/locked ]] }
+
+# find-generic-password -w prints printable ASCII as is, anything else as hex
+print_pw() {
+	local v=$(<$1)
+	if [[ $v == [[:print:]]## && $v != *[^[:ascii:]]* ]]; then
+		print -r -- $v
+	else
+		print -rn -- $v | od -An -v -tx1 | tr -d ' \n'; print
+	fi
+}
+
+run_cmd() {
+	local cmd=$1; shift
+	case $cmd in
+	find-generic-password)
+		locked && return 51
+		local s; s=$(opt -s "$@") || return 2
+		[[ -f $(item $s) ]] || return 44
+		print_pw $(item $s) ;;
+	add-generic-password)
+		locked && return 51
+		local s x; s=$(opt -s "$@") || return 2
+		if x=$(opt -X "$@"); then
+			[[ $x == [0-9a-fA-F]## ]] || return 2
+			fromhex $x > $(item $s)
+		else
+			print -rn -- "$(opt -w "$@")" > $(item $s)
+		fi ;;
+	delete-generic-password)
+		locked && return 51
+		local s; s=$(opt -s "$@") || return 2
+		[[ -f $(item $s) ]] || return 44
+		rm -f $(item $s) ;;
+	dump-keychain)
+		[[ -e $D/dump-fails ]] && return 1
+		print -r -- "keychain: \"${@[-1]}\""
+		local f
+		for f in $D/items/*(N); do
+			print -r -- 'class: "genp"'
+			print -r -- 'attributes:'
+			print -r -- "    \"acct\"<blob>=\"$USER\""
+			print -r -- "    \"svce\"<blob>=\"$(fromhex ${f:t})\""
+		done ;;
+	show-keychain-info)
+		locked && return 36
+		print -r -- "Keychain \"${@[-1]}\" lock-on-sleep timeout=$(<$D/timeout)s" ;;
+	set-keychain-settings)
+		print -r -- "$(opt -t "$@")" > $D/timeout ;;
+	list-keychains)
+		if [[ ${(j: :)@} == *-s* ]]; then
+			shift 3   # -d user -s
+			print -rl -- "$@" > $D/searchlist
+		else
+			local p
+			for p in ${(f)"$(<$D/searchlist)"}; do print -r -- "    \"$p\""; done
+		fi ;;
+	lock-keychain) touch $D/locked ;;
+	unlock-keychain) rm -f $D/locked ;;
+	*) print -ru2 -- "fake-security: unsupported: $cmd"; return 2 ;;
+	esac
+}
+
+if [[ ${1:-} == -i ]]; then
+	# interactive mode: one command per line; always exits 0 like the real one
+	local line
+	while IFS= read -r line; do
+		run_cmd "${(Q@)${(z)line}}" || print -ru2 -- "fake-security: failed: $line"
+	done
+	exit 0
+fi
+run_cmd "$@"
